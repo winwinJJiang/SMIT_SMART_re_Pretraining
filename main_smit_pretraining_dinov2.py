@@ -37,6 +37,7 @@ from monai_backbone_fixed import SMIT_MONAI_Pretrain_Model  # Fix: use fixed ver
 from dinov2_loss.dino_clstoken_loss import DINOLoss
 from dinov2_loss.ibot_patch_loss import iBOTPatchLoss
 from dinov2_loss.koleo_loss_fixed import KoLeoLoss
+from dinov2_loss.gram_loss import GramLoss
 #import swin_models.TransMorphV2 as TransMorph
 #import swin_models.TransMorphV2_Bake as TransMorph
 
@@ -155,6 +156,12 @@ def get_args_parser():
     parser.add_argument('--monai_num_heads', nargs=4, type=int, default=[3,6,12,24], help='MONAI backbone num_heads')
     parser.add_argument('--monai_window_size', default=7, type=int, help='MONAI backbone window size')
     parser.add_argument('--use_flash_attn', default=0, type=int, help='Use FlashAttention via PyTorch SDPA')
+    parser.add_argument('--use_local_crops', default=0, type=int, help='Enable 3D local crops for multi-scale learning')
+    parser.add_argument('--n_local_crops', default=2, type=int, help='Number of local crops per image')
+    parser.add_argument('--local_crop_scale', default=0.5, type=float, help='Local crop size as fraction of global (e.g. 0.5 = half size)')
+    parser.add_argument('--use_gram_loss', default=0, type=int, help='Enable Gram anchoring loss')
+    parser.add_argument('--gram_weight', default=0.1, type=float, help='Gram loss weight')
+    parser.add_argument('--gram_update_freq', default=50, type=int, help='Update Gram teacher every N epochs')
     parser.add_argument('--use_dinov2_loss', default=0, type=int, help='Use DINOv2-style SK losses instead of EMA center')
     parser.add_argument('--use_koleo', default=0, type=int, help='Add KoLeo regularizer')
     parser.add_argument('--koleo_weight', default=0.1, type=float, help='KoLeo loss weight')
@@ -228,6 +235,9 @@ def train_func(args):
         #CT and MRI
 
         train_set3D = Dataset3D_Jue_Custmzed_CT_and_MRI_Not_Square(args.data_path, args.list_path3D,args.teacher_mask_ratio, crop_size_3D=args.img_size3D,use_intencty_Aug=args.intensity_Aug,used_3D_resize=args.use_3D_resize)
+        if args.use_local_crops:
+            local_crop_size = [int(s * args.local_crop_scale) for s in args.img_size3D]
+            print(f"Local crops enabled: {args.n_local_crops} crops of size {local_crop_size}")
 
 
     data_loader3D = torch.utils.data.DataLoader(
@@ -423,7 +433,15 @@ def train_func(args):
         ).cuda()
         koleo_loss_fn = KoLeoLoss() if args.use_koleo else None
         trainloss = None  # not used in DINOv2 mode
-        print(f'Using DINOv2-style losses: DINO_SK + iBOT_SK + KoLeo={args.use_koleo} (weight={args.koleo_weight})')
+        gram_loss_fn = GramLoss(remove_neg=True) if args.use_gram_loss else None
+        gram_teacher = None
+        if args.use_gram_loss:
+            import copy
+            gram_teacher = copy.deepcopy(student)
+            for p in gram_teacher.parameters():
+                p.requires_grad = False
+            print(f'Gram teacher initialized (update every {args.gram_update_freq} epochs)')
+        print(f'Using DINOv2-style losses: DINO_SK + iBOT_SK + KoLeo={args.use_koleo} + Gram={args.use_gram_loss}')
     else:
         # Original iBOT loss with EMA centering
         koleo_loss_fn = KoLeoLoss() if args.use_koleo else None
@@ -585,6 +603,12 @@ def train_several_epoch(student, teacher, teacher_without_ddp, trainloss, data_l
         #    if '3D' in name:  
         #        param.requires_grad = True
         # Fix #4: removed DDP re-wrapping (done once before training loop)
+        # Update Gram teacher periodically
+        if args.use_gram_loss and args.use_dinov2_loss and gram_teacher is not None:
+            if epoch % args.gram_update_freq == 0:
+                gram_teacher.load_state_dict(student.module.state_dict())
+                if utils.is_main_process():
+                    print(f'Gram teacher updated at epoch {epoch}')
         train_stats = train_one_epoch3D(student, teacher, teacher_without_ddp, trainloss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
@@ -856,7 +880,10 @@ def train_one_epoch3D(student, teacher, teacher_without_ddp, trainloss, data_loa
 
                 # DINO CLS loss with SK centering
                 # student_cls: [2*B, out_dim], teacher_cls: [2*B, out_dim]
-                student_cls_list = student_cls.chunk(2)  # list of [B, out_dim]
+                student_cls_list = list(student_cls.chunk(2))  # list of [B, out_dim]
+                # Add local crop CLS tokens (student only, not teacher)
+                if args.use_local_crops and len(local_cls_list) > 0:
+                    student_cls_list.extend(local_cls_list)
                 teacher_cls_stacked = torch.stack(teacher_cls.chunk(2))  # [2, B, out_dim]
                 temp_cls = args.teacher_temp
                 loss_cls = dino_loss(student_cls_list, teacher_cls_stacked, temp_cls)
@@ -884,9 +911,17 @@ def train_one_epoch3D(student, teacher, teacher_without_ddp, trainloss, data_loa
                 # KoLeo regularizer on student CLS embeddings
                 koleo_val = torch.tensor(0.0, device=student_cls.device)
                 if args.use_koleo and koleo_loss_fn is not None:
-                    # Use student CLS features before projection head
                     koleo_val = koleo_loss_fn(student_cls) * args.koleo_weight
                     volume_loss = volume_loss + koleo_val
+
+                # Gram anchoring loss
+                gram_val = torch.tensor(0.0, device=student_cls.device)
+                if args.use_gram_loss and gram_loss_fn is not None and gram_teacher is not None:
+                    with torch.no_grad():
+                        gram_teacher_out = gram_teacher(images, masks_teacher)
+                        gram_teacher_patch = gram_teacher_out[0][1]  # patch features
+                    gram_val = gram_loss_fn(student_patch, gram_teacher_patch.detach()) * args.gram_weight
+                    volume_loss = volume_loss + gram_val
 
             else:
                 all_loss = trainloss(student_output, teacher_output, student_local_cls, mask_token, epoch)
@@ -1057,6 +1092,8 @@ def train_one_epoch3D(student, teacher, teacher_without_ddp, trainloss, data_loa
         metric_logger.update(loss_rec=image_rec_loss.item())
         if args.use_koleo:
             metric_logger.update(loss_koleo=koleo_val.item())
+        if args.use_gram_loss and args.use_dinov2_loss:
+            metric_logger.update(loss_gram=gram_val.item())
         metric_logger.update(loss_teacher_rec=teacher_rec_loss.item())
         if args.image_distil:
             metric_logger.update(loss_img_dis=imge_rec_diss_loss.item())
