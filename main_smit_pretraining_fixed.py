@@ -33,14 +33,14 @@ from models.MiT import iBOTHead_w_Rec_2_Loss_Att as iBOTHead #as Head
 #from ibot_models.head import iBOTHead as Head 
 from swin_models.TransMorph import CONFIGS as CONFIGS_TM
 import swin_models.TransMorph as TransMorph
-from monai_backbone import SMIT_MONAI_Pretrain_Model
+from monai_backbone_fixed import SMIT_MONAI_Pretrain_Model  # Fix: use fixed version
 #import swin_models.TransMorphV2 as TransMorph
 #import swin_models.TransMorphV2_Bake as TransMorph
 
 
 
 from att_mask.attmask import AttMask,AttMask_Debug
-from data_loader3D_mask_ASM_Teacher_fixed import  # Fix #13: use fixed data loader with flip_prob Dataset3D,Dataset3D_No_Intensity_Aug,Dataset3D_Jue_Custmzed,Dataset3D_Jue_Custmzed_CT_and_MRI,Dataset3D_Jue_Custmzed_CT_and_MRI_Not_Square,Dataset3D_Jue_Custmzed_CT_Not_Square
+from data_loader3D_mask_ASM_Teacher_fixed import Dataset3D,Dataset3D_No_Intensity_Aug,Dataset3D_Jue_Custmzed,Dataset3D_Jue_Custmzed_CT_and_MRI,Dataset3D_Jue_Custmzed_CT_and_MRI_Not_Square,Dataset3D_Jue_Custmzed_CT_Not_Square  # Fix #13
 #from data_loader2D import Dataset2D
 import nibabel as nib
 fig = plt.figure()
@@ -621,6 +621,7 @@ def train_one_epoch3D(student, teacher, teacher_without_ddp, trainloss, data_loa
     student_params = dict(student.module.named_parameters())
     teacher_params = dict(teacher_without_ddp.named_parameters())
     names_common = sorted(set(student_params.keys()) & set(teacher_params.keys()))
+    assert len(names_common) > 0, 'No common parameters between student and teacher!'
     params_q = [student_params[n] for n in names_common]
     params_k = [teacher_params[n] for n in names_common]
     for it, subjects_batch in enumerate(metric_logger.log_every(data_loader, 10, header)):

@@ -33,7 +33,7 @@ class KoLeoLoss(nn.Module):
         """
         # Fix #10: guard for degenerate cases
         if features.shape[0] < 2:
-            return torch.tensor(0.0, device=features.device)
+            return features.sum() * 0.0  # Fix: preserve autograd path
 
         # Gather features from all GPUs for accurate NN computation
         feats = F.normalize(features, p=2, dim=-1)

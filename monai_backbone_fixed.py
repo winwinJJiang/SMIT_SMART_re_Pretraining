@@ -204,7 +204,7 @@ class MonaiSwinBackbone(nn.Module):
             cls_tokens, att_map = blk(x_feature, cls_tokens)
         # Fix #12: guard against att_map=None when Cait_layer=0
         if att_map is None:
-            att_map = torch.zeros(B, 1, 1, x_feature.shape[1] + 1, device=x_feature.device)
+            att_map = torch.zeros(B, 1, 1, x_feature.shape[1] + 1, device=x_feature.device, dtype=x_feature.dtype)
         
         return x_feature, cls_tokens, x_last, att_map
 
