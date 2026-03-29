@@ -1,6 +1,6 @@
 #!/bin/bash
-# SMIT pretraining with DINOv2 improvements (SK centering + KoLeo)
-# On MONAI SwinUNETR V2 backbone (VoCo architecture)
+# SMIT pretraining with ALL DINOv2 improvements
+# SK centering + KoLeo + FlashAttention + high drop path + untied heads + larger out_dim
 
 # Architecture (VoCo)
 embed_dim=48
@@ -20,13 +20,17 @@ lr=0.0008
 use_fp16=1
 pred_start_epoch=400
 
-# DINOv2 improvements
-use_dinov2_loss=1
-use_koleo=1
-koleo_weight=0.1
-rec_weight=10.0  # reduced from 60.0
+# === DINOv2 improvements ===
+use_dinov2_loss=1       # SK centering for CLS + patch
+use_koleo=1             # KoLeo regularizer
+koleo_weight=0.1        # KoLeo weight
+rec_weight=10.0         # Reconstruction weight (reduced from 60)
+use_flash_attn=1        # FlashAttention via SDPA
+drop_path_rate=0.3      # Higher stochastic depth (was 0.1)
+out_dim=65536           # Larger prototype vocabulary (was 8192)
+shared_head_teacher=0   # Untied teacher heads (was 1)
 
-# Disable attention-guided masking and teacher noise for baseline
+# SMIT-specific (disabled for baseline)
 use_att_mask=0
 teacher_mask_ratio=0
 
@@ -35,7 +39,7 @@ data_path="/data1/lia5/Jue/Data/CT/"
 data_txt_list="previous_14k_data.txt"
 
 # Output
-output="snapshots/SMIT_MONAI_VoCo_arch_96_dinov2"
+output="snapshots/SMIT_MONAI_VoCo_arch_96_dinov2_full"
 
 hst_name=$(hostname)
 
@@ -56,6 +60,10 @@ torchrun --nproc_per_node=8 \
 --use_koleo=$use_koleo \
 --koleo_weight=$koleo_weight \
 --rec_weight_override=$rec_weight \
+--use_flash_attn=$use_flash_attn \
+--out_dim=$out_dim \
+--patch_out_dim=$out_dim \
+--shared_head_teacher=$shared_head_teacher \
 --interval=2 \
 --arch="model_small" \
 --data_path=$data_path \
@@ -84,11 +92,11 @@ torchrun --nproc_per_node=8 \
 --image_distil_start_epoch=-100 \
 --teacher_rec=0 \
 --att_threshold=0.1 \
---flip_prob=0.2 \
+--flip_prob=0.5 \
 --use_fp16=$use_fp16 \
 --img_size3D_x=$img_size3D_x \
 --img_size3D_y=$img_size3D_y \
 --img_size3D_z=$img_size3D_z \
 --pred_start_epoch=$pred_start_epoch \
 --wandb_project=SMIT_pretraining \
---wandb_run=SMIT_MONAI_dinov2_96
+--wandb_run=SMIT_MONAI_dinov2_full_96

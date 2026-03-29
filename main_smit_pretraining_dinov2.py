@@ -154,6 +154,7 @@ def get_args_parser():
     parser.add_argument('--monai_depths', nargs=4, type=int, default=[2,2,2,2], help='MONAI backbone depths')
     parser.add_argument('--monai_num_heads', nargs=4, type=int, default=[3,6,12,24], help='MONAI backbone num_heads')
     parser.add_argument('--monai_window_size', default=7, type=int, help='MONAI backbone window size')
+    parser.add_argument('--use_flash_attn', default=0, type=int, help='Use FlashAttention via PyTorch SDPA')
     parser.add_argument('--use_dinov2_loss', default=0, type=int, help='Use DINOv2-style SK losses instead of EMA center')
     parser.add_argument('--use_koleo', default=0, type=int, help='Add KoLeo regularizer')
     parser.add_argument('--koleo_weight', default=0.1, type=float, help='KoLeo loss weight')
@@ -242,6 +243,39 @@ def train_func(args):
 
     # ============ building student and teacher networks ... ============
     
+
+    # === FlashAttention via SDPA ===
+    if args.use_flash_attn:
+        import monai.networks.nets.swin_unetr as swin_mod
+        _orig_wa_forward = swin_mod.WindowAttention.forward
+        def _flash_wa_forward(self, x, mask):
+            b, n, c = x.shape
+            qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            # Use PyTorch SDPA (auto-selects FlashAttention when possible)
+            attn_mask_sdpa = None
+            if mask is not None:
+                nw = mask.shape[0]
+                attn_mask_sdpa = mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1).reshape(b, self.num_heads, n, n)
+            # Add relative position bias
+            rel_pos_bias = self.relative_position_bias_table[
+                self.relative_position_index.clone()[:n, :n].reshape(-1)
+            ].reshape(n, n, -1).permute(2, 0, 1).contiguous().unsqueeze(0)
+            if attn_mask_sdpa is not None:
+                attn_mask_sdpa = attn_mask_sdpa + rel_pos_bias
+            else:
+                attn_mask_sdpa = rel_pos_bias.expand(b, -1, -1, -1)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask_sdpa.to(q.dtype),
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+            x = x.transpose(1, 2).reshape(b, n, c)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+        swin_mod.WindowAttention.forward = _flash_wa_forward
+        print("FlashAttention enabled via SDPA monkey-patch")
+
     if args.use_monai_backbone:
         # === MONAI SwinUNETR V2 backbone (VoCo architecture) ===
         import ml_collections
@@ -433,7 +467,7 @@ def train_func(args):
         args.lr,
         args.min_lr,
         args.epochs, len(data_loader3D),  # Fix #1: use len(data_loader) not len(dataset)
-        warmup_epochs=int(0.1*args.epochs),#args.warmup_epochs,
+        warmup_epochs=args.warmup_epochs,  # Fix: use --warmup_epochs arg
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
@@ -562,7 +596,7 @@ def train_several_epoch(student, teacher, teacher_without_ddp, trainloss, data_l
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
             'args': args,
-            'loss': trainloss.state_dict(),
+            'loss': trainloss.state_dict() if trainloss is not None else {'dino': dino_loss.state_dict(), 'ibot': ibot_loss.state_dict()},
         }
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
