@@ -1,0 +1,8 @@
+snapshots/
+logs/
+wandb/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.nii.gz
